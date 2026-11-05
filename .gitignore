@@ -1,0 +1,22 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.sqlite3
+
+# Virtual environments
+.venv/
+venv/
+
+# Django
+staticfiles/
+media/
+
+# Test and coverage
+.coverage
+htmlcov/
+.pytest_cache/
