@@ -1,6 +1,7 @@
 from django.test import SimpleTestCase, TestCase
 from apps.accounting.models import LedgerAccount, AccountType, Currency
 from django.db import IntegrityError, transaction
+from django.db.models import ProtectedError
 
 class LedgerAccountTests(SimpleTestCase):
 
@@ -71,7 +72,29 @@ class LedgerAccountDatabaseTests(TestCase):
                     currency=ngn,
                 )
                 
-            actual = LedgerAccount.objects.count()
-            expected = 1
+        actual = LedgerAccount.objects.count()
+        expected = 1
 
-            self.assertEqual(actual, expected)
+        self.assertEqual(actual, expected)
+
+    def test_currency_cannot_be_deleted_while_referenced(self):
+        ngn = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        LedgerAccount.objects.create(
+            account_code="WALLET-001",
+            account_name="Customer Wallet NGN",
+            account_type=AccountType.LIABILITY,
+            currency=ngn,
+        )
+
+        with self.assertRaises(ProtectedError):
+            ngn.delete()
+
+        actual = Currency.objects.filter(currency_code="NGN").exists()
+        expected = True
+
+        self.assertEqual(actual, expected)
