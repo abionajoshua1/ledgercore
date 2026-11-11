@@ -6,7 +6,13 @@ from apps.accounting.models import Currency, LedgerAccount, AccountType
 from apps.wallets.models import Wallet
 
 from apps.wallets.services import create_wallet as create_wallet_service, WalletCreationError
+from unittest.mock import patch
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+from django.db import close_old_connections
+from django.test import TransactionTestCase
 
 User = get_user_model()
 
@@ -186,3 +192,90 @@ class WalletDatabaseTests(TestCase):
 
         self.assertEqual(Wallet.objects.count(), 1)
         self.assertEqual(LedgerAccount.objects.count(), account_count_before)
+        
+    def test_ledger_account_is_rolled_back_when_wallet_creation_fails(self):
+        account_count_before = LedgerAccount.objects.count()
+        wallet_count_before = Wallet.objects.count()
+
+        with patch(
+            "apps.wallets.services.Wallet.objects.create",
+            side_effect=IntegrityError("Simulated wallet creation failure"),
+        ):
+            with self.assertRaises(IntegrityError):
+                create_wallet_service(
+                    user=self.user,
+                    currency=self.ngn,
+                )
+
+        self.assertEqual(
+            LedgerAccount.objects.count(),
+            account_count_before,
+        )
+
+        self.assertEqual(
+            Wallet.objects.count(),
+            wallet_count_before,
+        )
+        
+class WalletCreationConcurrencyTests(TransactionTestCase):
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="concurrent_user",
+            password="test-password",
+        )
+
+        self.currency = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+    def test_concurrent_requests_cannot_create_duplicate_wallets(self):
+        barrier = Barrier(2)
+
+        def create_wallet_concurrently():
+            close_old_connections()
+
+            try:
+                user = User.objects.get(pk=self.user.pk)
+                currency = Currency.objects.get(pk=self.currency.pk)
+
+                # Make both threads start wallet creation together.
+                barrier.wait(timeout=10)
+
+                try:
+                    create_wallet_service(
+                        user=user,
+                        currency=currency,
+                    )
+                    return "created"
+
+                except WalletCreationError:
+                    return "duplicate"
+
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(create_wallet_concurrently)
+                for _ in range(2)
+            ]
+
+            results = [future.result(timeout=30) for future in futures]
+
+        self.assertCountEqual(
+            results,
+            ["created", "duplicate"],
+        )
+
+        self.assertEqual(
+            Wallet.objects.filter(
+                user=self.user,
+                currency=self.currency,
+            ).count(),
+            1,
+        )
+
+        self.assertEqual(LedgerAccount.objects.count(), 1)

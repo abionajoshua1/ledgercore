@@ -1,10 +1,12 @@
 import uuid
 
-from django.db import transaction
+from django.db import transaction, IntegrityError
 from django.contrib.auth import get_user_model
 
-from apps.accounting.models import AccountType, Currency, LedgerAccount
+from apps.accounting.models import AccountType, Currency, LedgerAccount, JournalLine
 from apps.wallets.models import Wallet
+
+from django.db.models import Sum, Q
 
 User = get_user_model()
 
@@ -33,18 +35,57 @@ def create_wallet(*, user, currency):
 
     wallet_id = uuid.uuid4()
 
-    ledger_account = LedgerAccount.objects.create(
-        account_code=f"WALLET-{wallet_id.hex[:20]}",
-        account_name=f"Customer Wallet {wallet_id.hex[:12].upper()}",
-        account_type=AccountType.LIABILITY,
-        currency=currency,
-    )
+    try:
+        with transaction.atomic():
+            ledger_account = LedgerAccount.objects.create(
+                account_code=f"WALLET-{wallet_id.hex[:20]}",
+                account_name=f"Customer Wallet {wallet_id.hex[:12].upper()}",
+                account_type=AccountType.LIABILITY,
+                currency=currency,
+            )
 
-    wallet = Wallet.objects.create(
-        id=wallet_id,
-        user=user,
-        currency=currency,
-        ledger_account=ledger_account,
-    )
+            wallet = Wallet.objects.create(
+                id=wallet_id,
+                user=user,
+                currency=currency,
+                ledger_account=ledger_account,
+            )
+
+    except IntegrityError as exc:
+        cause = exc.__cause__
+        constraint_name = getattr(
+            getattr(cause, "diag", None),
+            "constraint_name",
+            None,
+        )
+
+        if constraint_name == "uniq_nonclosed_wallet_per_user_currency":
+            raise WalletCreationError(
+                "You already have a wallet in this currency."
+            ) from exc
+
+        raise
 
     return wallet
+
+def get_wallet_balance(*, wallet):
+    journal_lines = JournalLine.objects.filter(
+        account_id=wallet.ledger_account_id,
+        entry__posted_at__isnull=False,
+    )
+
+    totals = journal_lines.aggregate(
+        total_credits=Sum(
+            "amount",
+            filter=Q(direction="CREDIT"),
+        ),
+        total_debits=Sum(
+            "amount",
+            filter=Q(direction="DEBIT"),
+        ),
+    )
+
+    total_credits = totals.get("total_credits") or 0
+    total_debits = totals.get("total_debits") or 0
+
+    return total_credits - total_debits
