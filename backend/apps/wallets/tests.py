@@ -2,10 +2,10 @@ from django.test import TestCase
 from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 
-from apps.accounting.models import Currency, LedgerAccount, AccountType
+from apps.accounting.models import Currency, LedgerAccount, AccountType, JournalEntry, JournalLine, OperationType, EntryDirection
 from apps.wallets.models import Wallet
 
-from apps.wallets.services import create_wallet as create_wallet_service, WalletCreationError
+from apps.wallets.services import create_wallet as create_wallet_service, WalletCreationError, get_wallet_balance
 from unittest.mock import patch
 
 from concurrent.futures import ThreadPoolExecutor
@@ -217,6 +217,19 @@ class WalletDatabaseTests(TestCase):
             wallet_count_before,
         )
         
+    def test_new_wallet_has_zero_balance(self):
+        wallet = create_wallet_service(
+            user=self.user,
+            currency=self.ngn,
+        )
+
+        balance = get_wallet_balance(wallet=wallet)
+
+        self.assertEqual(balance, 0)
+        
+
+
+ 
 class WalletCreationConcurrencyTests(TransactionTestCase):
 
     def setUp(self):
@@ -279,3 +292,137 @@ class WalletCreationConcurrencyTests(TransactionTestCase):
         )
 
         self.assertEqual(LedgerAccount.objects.count(), 1)
+        
+class WalletBalanceTests(TransactionTestCase):
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="balance_user",
+            password="test-password",
+        )
+
+        self.ngn = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        self.wallet = create_wallet_service(
+            user=self.user,
+            currency=self.ngn,
+        )
+
+    def test_wallet_balance_reflects_credits_and_debits(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN-001",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            deposit = JournalEntry.objects.create(
+                reference="DEP-TEST-001",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Test deposit",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=10000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=10000,
+                currency=self.ngn,
+            )
+
+            withdrawal = JournalEntry.objects.create(
+                reference="WD-TEST-001",
+                operation_type=OperationType.WITHDRAWAL,
+                currency=self.ngn,
+                description="Test withdrawal",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=withdrawal,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.DEBIT,
+                amount=3000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=withdrawal,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.CREDIT,
+                amount=3000,
+                currency=self.ngn,
+            )
+
+        balance = get_wallet_balance(wallet=self.wallet)
+
+        self.assertEqual(balance, 7000)
+        
+    def test_wallet_balance_excludes_unposted_journal_entries(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN-002",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            deposit = JournalEntry.objects.create(
+                reference="DEP-TEST-002",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Test deposit",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=5000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=5000,
+                currency=self.ngn,
+            )
+
+            self.assertIsNone(deposit.posted_at)
+            self.assertEqual(
+                get_wallet_balance(wallet=self.wallet),
+                0,
+            )
+
+        deposit.refresh_from_db()
+
+        self.assertIsNotNone(deposit.posted_at)
+        self.assertEqual(
+            get_wallet_balance(wallet=self.wallet),
+            5000,
+        )
+        
