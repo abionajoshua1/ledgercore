@@ -99,7 +99,9 @@ class WalletDatabaseTests(TestCase):
                     id=self.liability_account.id
                 ).update(account_type=AccountType.ASSET)
 
-        self.liability_account.refresh_from_db()
+        self.liability_account = LedgerAccount.objects.get(
+            id=self.liability_account.id
+        )
 
         self.assertEqual(
             self.liability_account.account_type,
@@ -226,9 +228,6 @@ class WalletDatabaseTests(TestCase):
         balance = get_wallet_balance(wallet=wallet)
 
         self.assertEqual(balance, 0)
-        
-
-
  
 class WalletCreationConcurrencyTests(TransactionTestCase):
 
@@ -426,3 +425,134 @@ class WalletBalanceTests(TransactionTestCase):
             5000,
         )
         
+    def test_wallet_balance_is_isolated_to_its_ledger_account(self):
+        second_user = User.objects.create_user(
+            username="second_balance_user",
+            password="test-password",
+        )
+
+        second_wallet = create_wallet_service(
+            user=second_user,
+            currency=self.ngn,
+        )
+
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN-003",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            first_deposit = JournalEntry.objects.create(
+                reference="DEP-ISOLATION-001",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="First customer deposit",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=first_deposit,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=5000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=first_deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=5000,
+                currency=self.ngn,
+            )
+
+            second_deposit = JournalEntry.objects.create(
+                reference="DEP-ISOLATION-002",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Second customer deposit",
+                initiated_by=second_user,
+            )
+
+            JournalLine.objects.create(
+                entry=second_deposit,
+                account=second_wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=9000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=second_deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=9000,
+                currency=self.ngn,
+            )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.wallet),
+            5000,
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=second_wallet),
+            9000,
+        )
+        
+    def test_inactive_and_closed_wallets_retain_their_balance(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN-004",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            deposit = JournalEntry.objects.create(
+                reference="DEP-LIFECYCLE-001",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Wallet lifecycle test deposit",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=12000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=12000,
+                currency=self.ngn,
+            )
+
+        self.wallet.status = Wallet.Status.INACTIVE
+        self.wallet.save(update_fields=["status"])
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.wallet),
+            12000,
+        )
+
+        self.wallet.status = Wallet.Status.CLOSED
+        self.wallet.save(update_fields=["status"])
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.wallet),
+            12000,
+        )
