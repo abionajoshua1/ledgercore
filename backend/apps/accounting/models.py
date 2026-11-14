@@ -118,6 +118,12 @@ class JournalEntry(models.Model):
                 condition=models.Q(operation_type__in=OperationType.values),
                 name="journal_entry_valid_operation_type",
             ),
+            
+            models.UniqueConstraint(
+                fields=["transaction"],
+                condition=models.Q(transaction__isnull=False),
+                name="unique_journal_entry_per_transaction",
+            ),
         ]
 
 class JournalLine(models.Model):
