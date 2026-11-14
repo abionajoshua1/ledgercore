@@ -74,6 +74,14 @@ class JournalEntry(models.Model):
         default=uuid.uuid4,
         editable=False,
     )
+    
+    transaction = models.ForeignKey(
+        "payments.Transaction",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="journal_entries",
+    )
 
     reference = models.CharField(max_length=50, unique=True)
     operation_type = models.CharField(
