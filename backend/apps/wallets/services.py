@@ -89,3 +89,56 @@ def get_wallet_balance(*, wallet):
     total_debits = totals.get("total_debits") or 0
 
     return total_credits - total_debits
+
+class WalletLifecycleError(Exception):
+    pass
+
+
+@transaction.atomic
+def deactivate_wallet(*, wallet):
+    wallet = Wallet.objects.select_for_update().get(pk=wallet.pk)
+
+    if wallet.status == Wallet.Status.INACTIVE:
+        raise WalletLifecycleError("This wallet is already inactive.")
+
+    if wallet.status == Wallet.Status.CLOSED:
+        raise WalletLifecycleError("A closed wallet cannot be deactivated.")
+
+    wallet.status = Wallet.Status.INACTIVE
+    wallet.save(update_fields=["status"])
+
+    return wallet
+
+@transaction.atomic
+def reactivate_wallet(*, wallet):
+    wallet = Wallet.objects.select_for_update().get(pk=wallet.pk)
+
+    if wallet.status == Wallet.Status.ACTIVE:
+        raise WalletLifecycleError("This wallet is already active.")
+
+    if wallet.status == Wallet.Status.CLOSED:
+        raise WalletLifecycleError("A closed wallet cannot be reactivated.")
+
+    wallet.status = Wallet.Status.ACTIVE
+    wallet.save(update_fields=["status"])
+
+    return wallet
+
+@transaction.atomic
+def close_wallet(*, wallet):
+    wallet = Wallet.objects.select_for_update().get(pk=wallet.pk)
+
+    if wallet.status == Wallet.Status.CLOSED:
+        raise WalletLifecycleError("This wallet is already closed.")
+
+    balance = get_wallet_balance(wallet=wallet)
+
+    if balance != 0:
+        raise WalletLifecycleError(
+            "A wallet with a non-zero balance cannot be closed."
+        )
+
+    wallet.status = Wallet.Status.CLOSED
+    wallet.save(update_fields=["status"])
+
+    return wallet

@@ -5,7 +5,7 @@ from django.db import IntegrityError, transaction
 from apps.accounting.models import Currency, LedgerAccount, AccountType, JournalEntry, JournalLine, OperationType, EntryDirection
 from apps.wallets.models import Wallet
 
-from apps.wallets.services import create_wallet as create_wallet_service, WalletCreationError, get_wallet_balance
+from apps.wallets.services import close_wallet, create_wallet as create_wallet_service, WalletCreationError, get_wallet_balance, reactivate_wallet
 from unittest.mock import patch
 
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +13,11 @@ from threading import Barrier
 
 from django.db import close_old_connections
 from django.test import TransactionTestCase
+
+from apps.wallets.services import (
+    deactivate_wallet,
+    WalletLifecycleError,
+)
 
 User = get_user_model()
 
@@ -556,3 +561,306 @@ class WalletBalanceTests(TransactionTestCase):
             get_wallet_balance(wallet=self.wallet),
             12000,
         )
+        
+class WalletLifecycleTests(TransactionTestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="lifecycle_user",
+            password="test-password",
+        )
+
+        self.ngn = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        self.wallet = create_wallet_service(
+            user=self.user,
+            currency=self.ngn,
+        )
+    def test_active_wallet_can_be_deactivated(self):
+        deactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.INACTIVE,
+        )
+        
+    def test_already_inactive_wallet_cannot_be_deactivated(self):
+        self.wallet.status = Wallet.Status.INACTIVE
+        self.wallet.save(update_fields=["status"])
+
+        with self.assertRaises(WalletLifecycleError):
+            deactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.INACTIVE,
+        )
+        
+    def test_closed_wallet_cannot_be_deactivated(self):
+        self.wallet.status = Wallet.Status.CLOSED
+        self.wallet.save(update_fields=["status"])
+
+        with self.assertRaises(WalletLifecycleError):
+            deactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.CLOSED,
+        )
+        
+    def test_funded_wallet_can_be_deactivated(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN-005",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            deposit = JournalEntry.objects.create(
+                reference="DEP-LIFECYCLE-002",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Wallet lifecycle test deposit",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=15000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=15000,
+                currency=self.ngn,
+            )
+
+        deactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.INACTIVE,
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.wallet),
+            15000,
+        )
+        
+    def test_inactive_wallet_can_be_reactivated(self):
+        self.wallet.status = Wallet.Status.INACTIVE
+        self.wallet.save(update_fields=["status"])
+
+        reactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.ACTIVE,
+        )
+
+    def test_active_wallet_cannot_be_reactivated(self):
+        with self.assertRaises(WalletLifecycleError):
+            reactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.ACTIVE,
+        )
+
+    def test_closed_wallet_cannot_be_reactivated(self):
+        self.wallet.status = Wallet.Status.CLOSED
+        self.wallet.save(update_fields=["status"])
+
+        with self.assertRaises(WalletLifecycleError):
+            reactivate_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.CLOSED,
+        )
+        
+    def test_active_wallet_can_be_closed(self):
+        close_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.CLOSED,
+        )
+        
+    def test_inactive_wallet_can_be_closed(self):
+        self.wallet.status = Wallet.Status.INACTIVE
+        self.wallet.save(update_fields=["status"])
+
+        close_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.CLOSED,
+        )
+        
+    def test_wallet_with_non_zero_balance_cannot_be_closed(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN-006",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            deposit = JournalEntry.objects.create(
+                reference="DEP-LIFECYCLE-003",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Wallet lifecycle test deposit",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=20000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=deposit,
+                account=settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=20000,
+                currency=self.ngn,
+            )
+
+        with self.assertRaises(WalletLifecycleError):
+            close_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.ACTIVE,
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.wallet),
+            20000,
+        )
+        
+    def test_closed_wallet_cannot_be_closed_again(self):
+        self.wallet.status = Wallet.Status.CLOSED
+        self.wallet.save(update_fields=["status"])
+
+        with self.assertRaises(WalletLifecycleError):
+            close_wallet(wallet=self.wallet)
+
+        self.wallet.refresh_from_db()
+
+        self.assertEqual(
+            self.wallet.status,
+            Wallet.Status.CLOSED,
+        )
+        
+def test_closing_wallet_preserves_historical_ledger_records(self):
+    settlement_account = LedgerAccount.objects.create(
+        account_code="SETTLEMENT-NGN-007",
+        account_name="NGN Settlement Account",
+        account_type=AccountType.ASSET,
+        currency=self.ngn,
+    )
+
+    with transaction.atomic():
+        deposit = JournalEntry.objects.create(
+            reference="DEP-LIFECYCLE-004",
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Wallet closure history test deposit",
+            initiated_by=self.user,
+        )
+
+        JournalLine.objects.create(
+            entry=deposit,
+            account=self.wallet.ledger_account,
+            line_number=1,
+            direction=EntryDirection.CREDIT,
+            amount=15000,
+            currency=self.ngn,
+        )
+
+        JournalLine.objects.create(
+            entry=deposit,
+            account=settlement_account,
+            line_number=2,
+            direction=EntryDirection.DEBIT,
+            amount=15000,
+            currency=self.ngn,
+        )
+
+        withdrawal = JournalEntry.objects.create(
+            reference="WDR-LIFECYCLE-004",
+            operation_type=OperationType.WITHDRAWAL,
+            currency=self.ngn,
+            description="Wallet closure history test withdrawal",
+            initiated_by=self.user,
+        )
+
+        JournalLine.objects.create(
+            entry=withdrawal,
+            account=self.wallet.ledger_account,
+            line_number=1,
+            direction=EntryDirection.DEBIT,
+            amount=15000,
+            currency=self.ngn,
+        )
+
+        JournalLine.objects.create(
+            entry=withdrawal,
+            account=settlement_account,
+            line_number=2,
+            direction=EntryDirection.CREDIT,
+            amount=15000,
+            currency=self.ngn,
+        )
+
+    self.assertEqual(get_wallet_balance(wallet=self.wallet), 0)
+
+    close_wallet(wallet=self.wallet)
+
+    self.wallet.refresh_from_db()
+
+    self.assertEqual(self.wallet.status, Wallet.Status.CLOSED)
+    self.assertTrue(JournalEntry.objects.filter(pk=deposit.pk).exists())
+    self.assertTrue(JournalEntry.objects.filter(pk=withdrawal.pk).exists())
+    self.assertEqual(JournalLine.objects.filter(entry=deposit).count(), 2)
+    self.assertEqual(JournalLine.objects.filter(entry=withdrawal).count(), 2)
+    self.assertEqual(get_wallet_balance(wallet=self.wallet), 0)
