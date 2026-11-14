@@ -49,6 +49,8 @@ INSTALLED_APPS = [
     'apps.users.apps.UsersConfig',
     "apps.accounting.apps.AccountingConfig",
     "apps.wallets.apps.WalletsConfig",
+    "apps.payments",
+    "apps.idempotency",
 ]
 
 MIDDLEWARE = [
