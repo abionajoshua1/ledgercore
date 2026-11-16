@@ -57,3 +57,51 @@ class Wallet(models.Model):
                 name="wallet_status_valid",
             ),
         ]
+        
+class Hold(models.Model):
+    class Status(models.TextChoices):
+        ACTIVE = "ACTIVE", "Active"
+        CAPTURED = "CAPTURED", "Captured"
+        RELEASED = "RELEASED", "Released"
+
+    id = models.UUIDField(
+        primary_key=True,
+        default=uuid.uuid4,
+        editable=False,
+    )
+
+    wallet = models.ForeignKey(
+        Wallet,
+        on_delete=models.PROTECT,
+        related_name="holds",
+    )
+
+    transaction = models.ForeignKey(
+        "payments.Transaction",
+        on_delete=models.PROTECT,
+        related_name="holds",
+    )
+
+    amount = models.PositiveBigIntegerField()
+
+    status = models.CharField(
+        max_length=10,
+        choices=Status.choices,
+        default=Status.ACTIVE,
+    )
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(amount__gt=0),
+                name="hold_amount_greater_than_zero",
+            ),
+            models.CheckConstraint(
+                condition=Q(status__in=["ACTIVE", "CAPTURED", "RELEASED"]),
+                name="hold_status_valid",
+            ),
+            models.UniqueConstraint(
+                fields=["transaction"],
+                name="uniq_hold_per_transaction",
+            ),
+        ]

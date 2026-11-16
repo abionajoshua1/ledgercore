@@ -4,9 +4,10 @@ from django.db import transaction, IntegrityError
 from django.contrib.auth import get_user_model
 
 from apps.accounting.models import AccountType, Currency, LedgerAccount, JournalLine
-from apps.wallets.models import Wallet
 
 from django.db.models import Sum, Q
+
+from apps.wallets.models import Wallet, Hold
 
 User = get_user_model()
 
@@ -89,10 +90,21 @@ def get_wallet_balance(*, wallet):
     total_debits = totals.get("total_debits") or 0
 
     return total_credits - total_debits
+    
+def get_wallet_available_balance(*, wallet):
+    ledger_balance = get_wallet_balance(wallet=wallet)
+
+    active_holds = Hold.objects.filter(
+        wallet=wallet,
+        status=Hold.Status.ACTIVE,
+    ).aggregate(
+        total=Sum("amount")
+    )["total"] or 0
+
+    return ledger_balance - active_holds
 
 class WalletLifecycleError(Exception):
     pass
-
 
 @transaction.atomic
 def deactivate_wallet(*, wallet):

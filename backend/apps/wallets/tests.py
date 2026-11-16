@@ -3,9 +3,9 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 
 from apps.accounting.models import Currency, LedgerAccount, AccountType, JournalEntry, JournalLine, OperationType, EntryDirection
-from apps.wallets.models import Wallet
+from apps.wallets.models import Wallet, Hold
 
-from apps.wallets.services import close_wallet, create_wallet as create_wallet_service, WalletCreationError, get_wallet_balance, reactivate_wallet
+from apps.wallets.services import close_wallet, create_wallet as create_wallet_service, WalletCreationError, get_wallet_available_balance, get_wallet_balance, reactivate_wallet
 from unittest.mock import patch
 
 from concurrent.futures import ThreadPoolExecutor
@@ -18,6 +18,8 @@ from apps.wallets.services import (
     deactivate_wallet,
     WalletLifecycleError,
 )
+
+from apps.payments.models import Transaction
 
 User = get_user_model()
 
@@ -864,3 +866,101 @@ def test_closing_wallet_preserves_historical_ledger_records(self):
     self.assertEqual(JournalLine.objects.filter(entry=deposit).count(), 2)
     self.assertEqual(JournalLine.objects.filter(entry=withdrawal).count(), 2)
     self.assertEqual(get_wallet_balance(wallet=self.wallet), 0)
+    
+class WalletAvailableBalanceTests(TransactionTestCase):
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="available_balance_user",
+            password="test-password",
+        )
+
+        self.ngn = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        self.wallet = create_wallet_service(
+            user=self.user,
+            currency=self.ngn,
+        )
+
+        self.settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-AVAILABLE-001",
+            account_name="Available Balance Settlement",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        with transaction.atomic():
+            entry = JournalEntry.objects.create(
+                reference="AVAILABLE-DEP-001",
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description="Initial wallet funding",
+                initiated_by=self.user,
+            )
+
+            JournalLine.objects.create(
+                entry=entry,
+                account=self.wallet.ledger_account,
+                line_number=1,
+                direction=EntryDirection.CREDIT,
+                amount=10000,
+                currency=self.ngn,
+            )
+
+            JournalLine.objects.create(
+                entry=entry,
+                account=self.settlement_account,
+                line_number=2,
+                direction=EntryDirection.DEBIT,
+                amount=10000,
+                currency=self.ngn,
+            )
+
+    def create_hold(self, *, status, amount=3000, reference="HOLD-001"):
+        payment = Transaction.objects.create(
+            reference=reference,
+            type=OperationType.DEPOSIT,
+            amount=amount,
+            currency=self.ngn,
+        )
+
+        return Hold.objects.create(
+            wallet=self.wallet,
+            transaction=payment,
+            amount=amount,
+            status=status,
+        )
+
+    def test_active_hold_reduces_available_balance(self):
+        self.create_hold(status=Hold.Status.ACTIVE)
+
+        self.assertEqual(
+            get_wallet_available_balance(wallet=self.wallet),
+            7000,
+        )
+
+    def test_captured_hold_does_not_reduce_available_balance(self):
+        self.create_hold(status=Hold.Status.CAPTURED)
+
+        self.assertEqual(
+            get_wallet_available_balance(wallet=self.wallet),
+            10000,
+        )
+
+    def test_released_hold_does_not_reduce_available_balance(self):
+        self.create_hold(status=Hold.Status.RELEASED)
+
+        self.assertEqual(
+            get_wallet_available_balance(wallet=self.wallet),
+            10000,
+        )
+
+    def test_no_holds_means_available_balance_equals_ledger_balance(self):
+        self.assertEqual(
+            get_wallet_available_balance(wallet=self.wallet),
+            10000,
+        )
