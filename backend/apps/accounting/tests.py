@@ -3,6 +3,13 @@ from apps.accounting.models import LedgerAccount, AccountType, Currency, Journal
 from django.db import IntegrityError, transaction
 from django.db.models import ProtectedError
 
+from unittest.mock import patch
+from apps.accounting.services import (
+    JournalPostingError,
+    create_journal_entry,
+)
+
+
 class LedgerAccountTests(SimpleTestCase):
 
     def test_normal_side(self):
@@ -430,3 +437,148 @@ class JournalEntryTests(TransactionTestCase):
             str(context.exception)
         )
         self.assertEqual(JournalLine.objects.filter(entry=entry).count(), 2)
+        
+class JournalPostingServiceTests(TransactionTestCase):
+
+    def setUp(self):
+        self.ngn = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        self.usd = Currency.objects.create(
+            currency_code="USD",
+            currency_name="US Dollar",
+            minor_unit_exponent=2,
+        )
+
+        self.bank_account = LedgerAccount.objects.create(
+            account_code="BANK-TEST",
+            account_name="Test Bank",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+        )
+
+        self.wallet_account = LedgerAccount.objects.create(
+            account_code="WALLET-TEST",
+            account_name="Test Wallet",
+            account_type=AccountType.LIABILITY,
+            currency=self.ngn,
+        )
+
+        self.usd_account = LedgerAccount.objects.create(
+            account_code="USD-TEST",
+            account_name="USD Account",
+            account_type=AccountType.ASSET,
+            currency=self.usd,
+        )
+
+    def get_valid_lines(self):
+        return [
+            {
+                "account": self.bank_account,
+                "direction": EntryDirection.DEBIT,
+                "amount": 10000,
+            },
+            {
+                "account": self.wallet_account,
+                "direction": EntryDirection.CREDIT,
+                "amount": 10000,
+            },
+        ]
+
+    def create_entry(self, lines=None):
+        return create_journal_entry(
+            reference="TEST-JOURNAL-001",
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test journal entry",
+            lines=lines if lines is not None else self.get_valid_lines(),
+        )
+
+    def test_balanced_journal_entry_posts_successfully(self):
+        entry = self.create_entry()
+
+        entry.refresh_from_db()
+
+        self.assertIsNotNone(entry.posted_at)
+        self.assertEqual(entry.lines.count(), 2)
+
+    def test_unbalanced_entry_is_rejected(self):
+        lines = self.get_valid_lines()
+        lines[1]["amount"] = 5000
+
+        with self.assertRaises(JournalPostingError):
+            self.create_entry(lines)
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_entry_with_fewer_than_two_lines_is_rejected(self):
+        lines = self.get_valid_lines()[:1]
+
+        with self.assertRaises(JournalPostingError):
+            self.create_entry(lines)
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_currency_mismatch_is_rejected(self):
+        lines = self.get_valid_lines()
+        lines[0]["account"] = self.usd_account
+
+        with self.assertRaises(JournalPostingError):
+            self.create_entry(lines)
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_invalid_direction_is_rejected(self):
+        lines = self.get_valid_lines()
+        lines[0]["direction"] = "INVALID"
+
+        with self.assertRaises(JournalPostingError):
+            self.create_entry(lines)
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_non_positive_or_non_integer_amount_is_rejected(self):
+        for amount in [0, -100, 1.5, True]:
+            with self.subTest(amount=amount):
+                lines = self.get_valid_lines()
+                lines[0]["amount"] = amount
+
+                with self.assertRaises(JournalPostingError):
+                    self.create_entry(lines)
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_inactive_account_is_rejected(self):
+        self.bank_account.is_active = False
+        self.bank_account.save(update_fields=["is_active"])
+
+        with self.assertRaises(JournalPostingError):
+            self.create_entry()
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+
+    def test_failure_during_line_creation_rolls_back_entry(self):
+        original_create = JournalLine.objects.create
+        calls = 0
+
+        def create_then_fail(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+
+            if calls == 1:
+                return original_create(*args, **kwargs)
+
+            raise RuntimeError("Simulated journal line failure")
+
+        with patch(
+            "apps.accounting.services.JournalLine.objects.create",
+            side_effect=create_then_fail,
+        ):
+            with self.assertRaises(RuntimeError):
+                self.create_entry()
+
+        self.assertEqual(JournalEntry.objects.count(), 0)
+        self.assertEqual(JournalLine.objects.count(), 0)
