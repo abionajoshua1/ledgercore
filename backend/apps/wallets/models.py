@@ -105,3 +105,42 @@ class Hold(models.Model):
                 name="uniq_hold_per_transaction",
             ),
         ]
+        
+
+class WalletTransferLimit(models.Model):
+    wallet = models.OneToOneField(
+        Wallet,
+        on_delete=models.PROTECT,
+        related_name="transfer_limits",
+    )
+
+    max_transaction_amount = models.PositiveBigIntegerField()
+    daily_amount_limit = models.PositiveBigIntegerField()
+    daily_transaction_limit = models.PositiveIntegerField()
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=Q(max_transaction_amount__gt=0),
+                name="transfer_max_amount_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(daily_amount_limit__gt=0),
+                name="transfer_daily_amount_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(daily_transaction_limit__gt=0),
+                name="transfer_daily_count_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(
+                    daily_amount_limit__gte=models.F(
+                        "max_transaction_amount"
+                    )
+                ),
+                name="transfer_daily_limit_gte_max_transaction",
+            ),
+        ]

@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.db import IntegrityError, transaction
 
 from apps.accounting.models import Currency, LedgerAccount, AccountType, JournalEntry, JournalLine, OperationType, EntryDirection
-from apps.wallets.models import Wallet, Hold
+from apps.wallets.models import Wallet, Hold, WalletTransferLimit
 
 from apps.wallets.services import close_wallet, create_wallet as create_wallet_service, WalletCreationError, get_wallet_available_balance, get_wallet_balance, reactivate_wallet
 from unittest.mock import patch
@@ -17,6 +17,8 @@ from django.test import TransactionTestCase
 from apps.wallets.services import (
     deactivate_wallet,
     WalletLifecycleError,
+    configure_wallet_transfer_limits,
+    WalletTransferLimitConfigurationError,
 )
 
 from apps.payments.models import Transaction
@@ -964,3 +966,133 @@ class WalletAvailableBalanceTests(TransactionTestCase):
             get_wallet_available_balance(wallet=self.wallet),
             10000,
         )
+        
+class WalletTransferLimitConfigurationTests(TestCase):
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username="limit-test-user",
+            password="test-password",
+        )
+
+        self.currency = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        self.wallet = create_wallet_service(
+            user=self.user,
+            currency=self.currency,
+        )
+
+    def configure_limits(
+        self,
+        max_transaction_amount=50000,
+        daily_amount_limit=200000,
+        daily_transaction_limit=10,
+    ):
+        return configure_wallet_transfer_limits(
+            wallet=self.wallet,
+            max_transaction_amount=max_transaction_amount,
+            daily_amount_limit=daily_amount_limit,
+            daily_transaction_limit=daily_transaction_limit,
+        )
+
+    def test_transfer_limits_are_created(self):
+        limits = self.configure_limits()
+
+        self.assertEqual(limits.wallet, self.wallet)
+        self.assertEqual(limits.max_transaction_amount, 50000)
+        self.assertEqual(limits.daily_amount_limit, 200000)
+        self.assertEqual(limits.daily_transaction_limit, 10)
+
+        self.assertEqual(WalletTransferLimit.objects.count(), 1)
+
+    def test_existing_transfer_limits_are_updated(self):
+        self.configure_limits()
+
+        updated_limits = self.configure_limits(
+            max_transaction_amount=75000,
+            daily_amount_limit=300000,
+            daily_transaction_limit=15,
+        )
+
+        self.assertEqual(updated_limits.max_transaction_amount, 75000)
+        self.assertEqual(updated_limits.daily_amount_limit, 300000)
+        self.assertEqual(updated_limits.daily_transaction_limit, 15)
+
+        self.assertEqual(WalletTransferLimit.objects.count(), 1)
+
+    def test_zero_and_negative_limits_are_rejected(self):
+        invalid_values = [
+            ("max_transaction_amount", 0),
+            ("max_transaction_amount", -100),
+            ("daily_amount_limit", 0),
+            ("daily_amount_limit", -100),
+            ("daily_transaction_limit", 0),
+            ("daily_transaction_limit", -1),
+        ]
+
+        for field, value in invalid_values:
+            with self.subTest(field=field, value=value):
+                values = {
+                    "max_transaction_amount": 50000,
+                    "daily_amount_limit": 200000,
+                    "daily_transaction_limit": 10,
+                }
+
+                values[field] = value
+
+                with self.assertRaises(
+                    WalletTransferLimitConfigurationError
+                ):
+                    self.configure_limits(**values)
+
+        self.assertEqual(WalletTransferLimit.objects.count(), 0)
+
+    def test_non_integer_limits_are_rejected(self):
+        invalid_values = [
+            ("max_transaction_amount", 500.5),
+            ("daily_amount_limit", "200000"),
+            ("daily_transaction_limit", True),
+        ]
+
+        for field, value in invalid_values:
+            with self.subTest(field=field, value=value):
+                values = {
+                    "max_transaction_amount": 50000,
+                    "daily_amount_limit": 200000,
+                    "daily_transaction_limit": 10,
+                }
+
+                values[field] = value
+
+                with self.assertRaises(
+                    WalletTransferLimitConfigurationError
+                ):
+                    self.configure_limits(**values)
+
+        self.assertEqual(WalletTransferLimit.objects.count(), 0)
+
+    def test_daily_amount_limit_cannot_be_lower_than_transaction_limit(self):
+        with self.assertRaises(
+            WalletTransferLimitConfigurationError
+        ):
+            self.configure_limits(
+                max_transaction_amount=100000,
+                daily_amount_limit=50000,
+            )
+
+        self.assertEqual(WalletTransferLimit.objects.count(), 0)
+
+    def test_closed_wallet_cannot_be_configured(self):
+        self.wallet.status = Wallet.Status.CLOSED
+        self.wallet.save(update_fields=["status"])
+
+        with self.assertRaises(
+            WalletTransferLimitConfigurationError
+        ):
+            self.configure_limits()
+
+        self.assertEqual(WalletTransferLimit.objects.count(), 0)

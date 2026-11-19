@@ -7,7 +7,7 @@ from apps.accounting.models import AccountType, Currency, LedgerAccount, Journal
 
 from django.db.models import Sum, Q
 
-from apps.wallets.models import Wallet, Hold
+from apps.wallets.models import Wallet, Hold, WalletTransferLimit
 
 User = get_user_model()
 
@@ -154,3 +154,50 @@ def close_wallet(*, wallet):
     wallet.save(update_fields=["status"])
 
     return wallet
+
+
+
+class WalletTransferLimitConfigurationError(Exception):
+    pass
+
+
+@transaction.atomic
+def configure_wallet_transfer_limits(
+    *,
+    wallet,
+    max_transaction_amount,
+    daily_amount_limit,
+    daily_transaction_limit,
+):
+    values = {
+        "max_transaction_amount": max_transaction_amount,
+        "daily_amount_limit": daily_amount_limit,
+        "daily_transaction_limit": daily_transaction_limit,
+    }
+
+    for field, value in values.items():
+        if type(value) is not int or value <= 0:
+            raise WalletTransferLimitConfigurationError(
+                f"{field} must be a positive integer."
+            )
+
+    if daily_amount_limit < max_transaction_amount:
+        raise WalletTransferLimitConfigurationError(
+            "Daily amount limit cannot be lower than the maximum transaction amount."
+        )
+
+    locked_wallet = Wallet.objects.select_for_update().get(
+        pk=wallet.pk,
+    )
+
+    if locked_wallet.status == Wallet.Status.CLOSED:
+        raise WalletTransferLimitConfigurationError(
+            "Cannot configure transfer limits for a closed wallet."
+        )
+
+    limits, _ = WalletTransferLimit.objects.update_or_create(
+        wallet=locked_wallet,
+        defaults=values,
+    )
+
+    return limits
