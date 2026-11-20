@@ -27,8 +27,15 @@ from apps.payments.transfer_services import (
     TransferLimitExceededError,
     TransferLimitNotConfiguredError,
     validate_transfer_limits,
+    InsufficientFundsError,
+    validate_transfer_funds,
 )
-from apps.wallets.services import create_wallet, configure_wallet_transfer_limits
+from apps.wallets.services import create_wallet, configure_wallet_transfer_limits, get_wallet_balance
+
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+
+from django.db import close_old_connections
 
 class TransactionReferenceTests(SimpleTestCase):
 
@@ -403,4 +410,238 @@ class TransferCurrencyValidationTests(TransactionTestCase):
                 type=OperationType.TRANSFER,
             ).count(),
             0,
+        )
+        
+    def test_concurrent_transfers_cannot_double_spend_wallet_balance(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-CONCURRENT",
+            account_name="Concurrent Test Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        deposit = create_transaction(
+            type=OperationType.DEPOSIT,
+            status="COMPLETED",
+            amount=10000,
+            currency=self.ngn,
+            destination_wallet=self.source_wallet,
+        )
+
+        create_journal_entry(
+            reference=deposit.reference,
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Concurrent transfer test funding",
+            transaction_record=deposit,
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 10000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 10000,
+                },
+            ],
+        )
+
+        barrier = Barrier(2)
+
+        sender_id = self.sender.pk
+        source_wallet_id = self.source_wallet.pk
+        destination_wallet_id = self.destination_wallet.pk
+
+        def attempt_transfer(idempotency_key):
+            close_old_connections()
+
+            try:
+                user = get_user_model().objects.get(pk=sender_id)
+
+                barrier.wait(timeout=10)
+
+                try:
+                    status, response, replayed = execute_transfer(
+                        user=user,
+                        source_wallet_id=source_wallet_id,
+                        destination_wallet_id=destination_wallet_id,
+                        amount=7000,
+                        currency="NGN",
+                        idempotency_key=idempotency_key,
+                        path="/v1/transfers",
+                    )
+
+                    if status == 201 and not replayed:
+                        return "success"
+
+                    return "unexpected"
+
+                except InsufficientFundsError:
+                    return "insufficient_funds"
+
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                attempt_transfer,
+                "concurrent-transfer-a",
+            )
+            second = executor.submit(
+                attempt_transfer,
+                "concurrent-transfer-b",
+            )
+
+            results = [
+                first.result(timeout=30),
+                second.result(timeout=30),
+            ]
+
+        self.assertCountEqual(
+            results,
+            ["success", "insufficient_funds"],
+        )
+
+        self.assertEqual(
+            Transaction.objects.filter(
+                type=OperationType.TRANSFER,
+                status="COMPLETED",
+            ).count(),
+            1,
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.source_wallet),
+            3000,
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.destination_wallet),
+            7000,
+        )
+        
+    def test_opposing_concurrent_transfers_complete_without_deadlock(self):
+        configure_wallet_transfer_limits(
+            wallet=self.destination_wallet,
+            max_transaction_amount=50000,
+            daily_amount_limit=200000,
+            daily_transaction_limit=10,
+        )
+
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-OPPOSING",
+            account_name="Opposing Transfer Settlement",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        for wallet, reference_suffix in [
+            (self.source_wallet, "A"),
+            (self.destination_wallet, "B"),
+        ]:
+            deposit = create_transaction(
+                type=OperationType.DEPOSIT,
+                status="COMPLETED",
+                amount=10000,
+                currency=self.ngn,
+                destination_wallet=wallet,
+            )
+
+            create_journal_entry(
+                reference=deposit.reference,
+                operation_type=OperationType.DEPOSIT,
+                currency=self.ngn,
+                description=f"Opposing transfer funding {reference_suffix}",
+                transaction_record=deposit,
+                lines=[
+                    {
+                        "account": settlement_account,
+                        "direction": EntryDirection.DEBIT,
+                        "amount": 10000,
+                    },
+                    {
+                        "account": wallet.ledger_account,
+                        "direction": EntryDirection.CREDIT,
+                        "amount": 10000,
+                    },
+                ],
+            )
+
+        barrier = Barrier(2)
+
+        def attempt_transfer(
+            user_id,
+            source_wallet_id,
+            destination_wallet_id,
+            idempotency_key,
+        ):
+            close_old_connections()
+
+            try:
+                user = get_user_model().objects.get(pk=user_id)
+
+                barrier.wait(timeout=10)
+
+                status, response, replayed = execute_transfer(
+                    user=user,
+                    source_wallet_id=source_wallet_id,
+                    destination_wallet_id=destination_wallet_id,
+                    amount=5000,
+                    currency="NGN",
+                    idempotency_key=idempotency_key,
+                    path="/v1/transfers",
+                )
+
+                return status, replayed
+
+            finally:
+                close_old_connections()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first = executor.submit(
+                attempt_transfer,
+                self.sender.pk,
+                self.source_wallet.pk,
+                self.destination_wallet.pk,
+                "opposing-transfer-a",
+            )
+
+            second = executor.submit(
+                attempt_transfer,
+                self.recipient.pk,
+                self.destination_wallet.pk,
+                self.source_wallet.pk,
+                "opposing-transfer-b",
+            )
+
+            results = [
+                first.result(timeout=30),
+                second.result(timeout=30),
+            ]
+
+        self.assertEqual(results, [(201, False), (201, False)])
+
+        self.source_wallet.refresh_from_db()
+        self.destination_wallet.refresh_from_db()
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.source_wallet),
+            10000,
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.destination_wallet),
+            10000,
+        )
+
+        self.assertEqual(
+            Transaction.objects.filter(
+                type=OperationType.TRANSFER,
+                status="COMPLETED",
+            ).count(),
+            2,
         )
