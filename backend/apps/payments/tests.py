@@ -3,7 +3,7 @@ from unittest.mock import patch
 from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase
 
-from apps.accounting.models import Currency, OperationType
+from apps.accounting.models import Currency, OperationType, JournalEntry, JournalLine
 from apps.payments.models import Transaction
 from apps.payments.references import generate_transaction_reference
 from apps.payments.services import create_transaction
@@ -36,6 +36,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 from django.db import close_old_connections
+from apps.idempotency.models import IdempotencyKey
 
 class TransactionReferenceTests(SimpleTestCase):
 
@@ -644,4 +645,85 @@ class TransferCurrencyValidationTests(TransactionTestCase):
                 status="COMPLETED",
             ).count(),
             2,
+        )
+        
+    @patch(
+        "apps.payments.transfer_services.create_journal_entry",
+        side_effect=RuntimeError("Simulated journal posting failure"),
+    )
+    def test_journal_posting_failure_rolls_back_transfer(self, mock_journal):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        deposit = create_transaction(
+            type=OperationType.DEPOSIT,
+            status="COMPLETED",
+            amount=15000,
+            currency=self.ngn,
+            destination_wallet=self.source_wallet,
+        )
+
+        create_journal_entry(
+            reference=deposit.reference,
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test wallet funding",
+            transaction_record=deposit,
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 15000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 15000,
+                },
+            ],
+        )
+
+        initial_source_balance = get_wallet_balance(self.source_wallet)
+        initial_destination_balance = get_wallet_balance(self.destination_wallet)
+
+        with self.assertRaises(RuntimeError):
+            execute_transfer(
+                user=self.sender,
+                source_wallet_id=self.source_wallet.id,
+                destination_wallet_id=self.destination_wallet.id,
+                amount=5000,
+                currency="NGN",
+                idempotency_key="atomicity-failure-key",
+                path="/v1/transfers",
+            )
+
+        self.assertTrue(mock_journal.called)
+
+        self.assertFalse(
+            Transaction.objects.filter(type=OperationType.TRANSFER).exists()
+        )
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                operation_type=OperationType.TRANSFER
+            ).exists()
+        )
+        self.assertFalse(
+            IdempotencyKey.objects.filter(
+                user=self.sender,
+                key="atomicity-failure-key",
+            ).exists()
+        )
+
+        self.assertEqual(
+            get_wallet_balance(self.source_wallet),
+            initial_source_balance,
+        )
+        self.assertEqual(
+            get_wallet_balance(self.destination_wallet),
+            initial_destination_balance,
         )
