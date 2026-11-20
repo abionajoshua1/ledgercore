@@ -687,9 +687,8 @@ class TransferCurrencyValidationTests(TransactionTestCase):
                 },
             ],
         )
-
-        initial_source_balance = get_wallet_balance(self.source_wallet)
-        initial_destination_balance = get_wallet_balance(self.destination_wallet)
+        initial_source_balance = get_wallet_balance(wallet=self.source_wallet)
+        initial_destination_balance = get_wallet_balance(wallet=self.destination_wallet)
 
         with self.assertRaises(RuntimeError):
             execute_transfer(
@@ -720,10 +719,10 @@ class TransferCurrencyValidationTests(TransactionTestCase):
         )
 
         self.assertEqual(
-            get_wallet_balance(self.source_wallet),
+            get_wallet_balance(wallet=self.source_wallet),
             initial_source_balance,
         )
         self.assertEqual(
-            get_wallet_balance(self.destination_wallet),
+            get_wallet_balance(wallet=self.destination_wallet),
             initial_destination_balance,
         )
