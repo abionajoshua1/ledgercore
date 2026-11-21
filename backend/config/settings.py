@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     "apps.wallets.apps.WalletsConfig",
     "apps.payments",
     "apps.idempotency",
+    "apps.outbox.apps.OutboxConfig",
 ]
 
 MIDDLEWARE = [

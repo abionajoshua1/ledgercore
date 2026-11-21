@@ -726,3 +726,87 @@ class TransferCurrencyValidationTests(TransactionTestCase):
             get_wallet_balance(wallet=self.destination_wallet),
             initial_destination_balance,
         )
+        
+    @patch(
+        "apps.payments.transfer_services.IdempotencyKey.save",
+        side_effect=RuntimeError("Simulated idempotency completion failure"),
+    )
+    def test_idempotency_completion_failure_rolls_back_transfer(
+        self,
+        mock_save,
+    ):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        deposit = create_transaction(
+            type=OperationType.DEPOSIT,
+            status="COMPLETED",
+            amount=15000,
+            currency=self.ngn,
+            destination_wallet=self.source_wallet,
+        )
+
+        create_journal_entry(
+            reference=deposit.reference,
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test wallet funding",
+            transaction_record=deposit,
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 15000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 15000,
+                },
+            ],
+        )
+
+        initial_source_balance = get_wallet_balance(wallet=self.source_wallet)
+        initial_destination_balance = get_wallet_balance(wallet=self.destination_wallet)
+
+        with self.assertRaises(RuntimeError):
+            execute_transfer(
+                user=self.sender,
+                source_wallet_id=self.source_wallet.id,
+                destination_wallet_id=self.destination_wallet.id,
+                amount=5000,
+                currency="NGN",
+                idempotency_key="completion-failure-key",
+                path="/v1/transfers",
+            )
+
+        self.assertTrue(mock_save.called)
+
+        self.assertFalse(
+            Transaction.objects.filter(type=OperationType.TRANSFER).exists()
+        )
+        self.assertFalse(
+            JournalEntry.objects.filter(
+                operation_type=OperationType.TRANSFER
+            ).exists()
+        )
+        self.assertFalse(
+            IdempotencyKey.objects.filter(
+                user=self.sender,
+                key="completion-failure-key",
+            ).exists()
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.source_wallet),
+            initial_source_balance,
+        )
+        self.assertEqual(
+            get_wallet_balance(wallet=self.destination_wallet),
+            initial_destination_balance,
+        )
