@@ -24,6 +24,8 @@ from datetime import datetime, time, timedelta, timezone as datetime_timezone
 
 from apps.wallets.models import WalletTransferLimit
 
+from apps.outbox.services import create_outbox_event
+
 
 class TransferError(Exception):
     pass
@@ -244,6 +246,7 @@ def execute_transfer(
     currency,
     idempotency_key,
     path,
+    request_id = None,
 ):
     if (
         not isinstance(currency, str)
@@ -304,6 +307,20 @@ def execute_transfer(
         source_wallet=source_wallet,
         destination_wallet=destination_wallet,
         amount=amount,
+    )
+    
+    create_outbox_event(
+        event_type="transfer_posted",
+        payload={
+            "request_id": str(request_id) if request_id else None,
+            "transaction_id": str(transfer.id),
+            "transaction_reference": transfer.reference,
+            "source_wallet_id": str(source_wallet.id),
+            "destination_wallet_id": str(destination_wallet.id),
+            "amount": amount,
+            "currency": currency_code,
+            "journal_entry_id": str(journal_entry.id),
+        },
     )
 
     response_body = build_transfer_response(
