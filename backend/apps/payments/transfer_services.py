@@ -26,6 +26,8 @@ from apps.wallets.models import WalletTransferLimit
 
 from apps.outbox.services import create_outbox_event
 
+from apps.audit.services import create_audit_event
+
 
 class TransferError(Exception):
     pass
@@ -320,6 +322,23 @@ def execute_transfer(
             "amount": amount,
             "currency": currency_code,
             "journal_entry_id": str(journal_entry.id),
+        },
+    )
+    
+    create_audit_event(
+        actor=user,
+        action="transfer_posted",
+        detail={
+            "resource_type": "transaction",
+            "resource_id": str(transfer.id),
+            "resource_reference": transfer.reference,
+            "outcome": "success",
+            "source_wallet_id": str(source_wallet.id),
+            "destination_wallet_id": str(destination_wallet.id),
+            "amount": amount,
+            "currency": currency_code,
+            "journal_entry_id": str(journal_entry.id),
+            "request_id": str(request_id) if request_id else None,
         },
     )
 

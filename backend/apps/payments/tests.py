@@ -4,7 +4,7 @@ from django.db import IntegrityError, transaction
 from django.test import SimpleTestCase, TestCase
 
 from apps.accounting.models import Currency, OperationType, JournalEntry, JournalLine
-from apps.payments.models import Transaction
+from apps.payments.models import Transaction, TransactionStatus
 from apps.payments.references import generate_transaction_reference
 from apps.payments.services import create_transaction
 
@@ -39,6 +39,7 @@ from django.db import close_old_connections
 from apps.idempotency.models import IdempotencyKey
 
 from apps.outbox.models import OutboxEvent
+from apps.audit.models import AuditEvent
 
 class TransactionReferenceTests(SimpleTestCase):
 
@@ -997,5 +998,203 @@ class TransferCurrencyValidationTests(TransactionTestCase):
             IdempotencyKey.objects.filter(
                 user=self.sender,
                 key="outbox-failure-001",
+            ).exists()
+        )
+        
+    def test_successful_transfer_creates_one_audit_event(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        deposit = create_transaction(
+            type=OperationType.DEPOSIT,
+            status=TransactionStatus.COMPLETED,
+            amount=15000,
+            currency=self.ngn,
+            destination_wallet=self.source_wallet,
+        )
+
+        create_journal_entry(
+            reference=deposit.reference,
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test wallet funding",
+            transaction_record=deposit,
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 15000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 15000,
+                },
+            ],
+        )
+
+        status_code, response_body, replayed = execute_transfer(
+            user=self.sender,
+            source_wallet_id=self.source_wallet.id,
+            destination_wallet_id=self.destination_wallet.id,
+            amount=5000,
+            currency="NGN",
+            idempotency_key="audit-transfer-001",
+            path="/v1/transfers",
+        )
+
+        audit_event = AuditEvent.objects.get(action="transfer_posted")
+
+        self.assertEqual(status_code, 201)
+        self.assertFalse(replayed)
+        self.assertEqual(AuditEvent.objects.count(), 1)
+        self.assertEqual(audit_event.actor, self.sender)
+        self.assertEqual(audit_event.detail["resource_id"], response_body["id"])
+        self.assertEqual(audit_event.detail["amount"], 5000)
+        
+    def test_idempotent_replay_does_not_create_duplicate_audit_event(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        deposit = create_transaction(
+            type=OperationType.DEPOSIT,
+            status=TransactionStatus.COMPLETED,
+            amount=15000,
+            currency=self.ngn,
+            destination_wallet=self.source_wallet,
+        )
+
+        create_journal_entry(
+            reference=deposit.reference,
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test wallet funding",
+            transaction_record=deposit,
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 15000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 15000,
+                },
+            ],
+        )
+
+        transfer_arguments = {
+            "user": self.sender,
+            "source_wallet_id": self.source_wallet.id,
+            "destination_wallet_id": self.destination_wallet.id,
+            "amount": 5000,
+            "currency": "NGN",
+            "idempotency_key": "audit-replay-001",
+            "path": "/v1/transfers",
+        }
+
+        first_result = execute_transfer(**transfer_arguments)
+        second_result = execute_transfer(**transfer_arguments)
+
+        self.assertEqual(first_result[0], 201)
+        self.assertEqual(second_result[0], 201)
+        self.assertFalse(first_result[2])
+        self.assertTrue(second_result[2])
+        self.assertEqual(first_result[1], second_result[1])
+        self.assertEqual(AuditEvent.objects.count(), 1)
+        
+    def test_audit_failure_rolls_back_transfer(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT-NGN",
+            account_name="NGN Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        deposit = create_transaction(
+            type=OperationType.DEPOSIT,
+            status=TransactionStatus.COMPLETED,
+            amount=15000,
+            currency=self.ngn,
+            destination_wallet=self.source_wallet,
+        )
+
+        create_journal_entry(
+            reference=deposit.reference,
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test wallet funding",
+            transaction_record=deposit,
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 15000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 15000,
+                },
+            ],
+        )
+
+        source_balance_before = get_wallet_balance(
+            wallet=self.source_wallet,
+        )
+        transaction_count_before = Transaction.objects.count()
+        journal_entry_count_before = JournalEntry.objects.count()
+
+        with patch(
+            "apps.payments.transfer_services.create_audit_event",
+            side_effect=RuntimeError("Audit storage unavailable"),
+        ):
+            with self.assertRaises(RuntimeError):
+                execute_transfer(
+                    user=self.sender,
+                    source_wallet_id=self.source_wallet.id,
+                    destination_wallet_id=self.destination_wallet.id,
+                    amount=5000,
+                    currency="NGN",
+                    idempotency_key="audit-failure-001",
+                    path="/v1/transfers",
+                )
+
+        self.assertEqual(
+            Transaction.objects.count(),
+            transaction_count_before,
+        )
+        self.assertEqual(
+            JournalEntry.objects.count(),
+            journal_entry_count_before,
+        )
+        self.assertEqual(
+            get_wallet_balance(wallet=self.source_wallet),
+            source_balance_before,
+        )
+        self.assertEqual(
+            OutboxEvent.objects.count(),
+            0,
+        )
+        self.assertEqual(
+            AuditEvent.objects.count(),
+            0,
+        )
+        self.assertFalse(
+            IdempotencyKey.objects.filter(
+                user=self.sender,
+                key="audit-failure-001",
             ).exists()
         )
