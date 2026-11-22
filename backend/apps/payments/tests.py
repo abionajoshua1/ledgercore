@@ -38,6 +38,8 @@ from threading import Barrier
 from django.db import close_old_connections
 from apps.idempotency.models import IdempotencyKey
 
+from apps.outbox.models import OutboxEvent
+
 class TransactionReferenceTests(SimpleTestCase):
 
     def test_reference_has_expected_prefix(self):
@@ -809,4 +811,191 @@ class TransferCurrencyValidationTests(TransactionTestCase):
         self.assertEqual(
             get_wallet_balance(wallet=self.destination_wallet),
             initial_destination_balance,
+        )
+        
+    def test_successful_transfer_creates_one_outbox_event(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT001",
+            account_name="Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        create_journal_entry(
+            reference="DEP-OUTBOX-001",
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test funding",
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 10000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 10000,
+                },
+            ],
+        )
+
+        status_code, response_body, replayed = execute_transfer(
+            user=self.sender,
+            source_wallet_id=self.source_wallet.id,
+            destination_wallet_id=self.destination_wallet.id,
+            amount=5000,
+            currency="NGN",
+            idempotency_key="outbox-transfer-001",
+            path="/v1/transfers",
+            request_id="test-request-001",
+        )
+
+        self.assertEqual(status_code, 201)
+        self.assertFalse(replayed)
+        self.assertEqual(OutboxEvent.objects.count(), 1)
+
+        event = OutboxEvent.objects.get()
+
+        self.assertEqual(event.event_type, "transfer_posted")
+        self.assertEqual(event.payload["request_id"], "test-request-001")
+        self.assertEqual(event.payload["transaction_id"], response_body["id"])
+        self.assertEqual(
+            event.payload["transaction_reference"],
+            response_body["reference"],
+        )
+        self.assertEqual(event.payload["amount"], 5000)
+        self.assertEqual(event.payload["currency"], "NGN")
+        self.assertEqual(
+            event.payload["journal_entry_id"],
+            response_body["journal_entry_id"],
+        )
+        
+    def test_idempotent_replay_does_not_create_duplicate_outbox_event(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT002",
+            account_name="Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        create_journal_entry(
+            reference="DEP-OUTBOX-002",
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test funding",
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 10000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 10000,
+                },
+            ],
+        )
+
+        transfer_arguments = {
+            "user": self.sender,
+            "source_wallet_id": self.source_wallet.id,
+            "destination_wallet_id": self.destination_wallet.id,
+            "amount": 5000,
+            "currency": "NGN",
+            "idempotency_key": "outbox-replay-001",
+            "path": "/v1/transfers",
+            "request_id": "test-request-002",
+        }
+
+        first_result = execute_transfer(**transfer_arguments)
+        second_result = execute_transfer(**transfer_arguments)
+
+        self.assertEqual(first_result[0], 201)
+        self.assertFalse(first_result[2])
+
+        self.assertEqual(second_result[0], 201)
+        self.assertTrue(second_result[2])
+
+        self.assertEqual(OutboxEvent.objects.count(), 1)
+        
+    def test_outbox_creation_failure_rolls_back_transfer(self):
+        settlement_account = LedgerAccount.objects.create(
+            account_code="SETTLEMENT003",
+            account_name="Settlement Account",
+            account_type=AccountType.ASSET,
+            currency=self.ngn,
+            is_system=True,
+        )
+
+        create_journal_entry(
+            reference="DEP-OUTBOX-003",
+            operation_type=OperationType.DEPOSIT,
+            currency=self.ngn,
+            description="Test funding",
+            lines=[
+                {
+                    "account": settlement_account,
+                    "direction": EntryDirection.DEBIT,
+                    "amount": 10000,
+                },
+                {
+                    "account": self.source_wallet.ledger_account,
+                    "direction": EntryDirection.CREDIT,
+                    "amount": 10000,
+                },
+            ],
+        )
+
+        source_balance_before = get_wallet_balance(
+            wallet=self.source_wallet
+        )
+        destination_balance_before = get_wallet_balance(
+            wallet=self.destination_wallet
+        )
+
+        with patch(
+            "apps.payments.transfer_services.create_outbox_event",
+            side_effect=RuntimeError("Outbox failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                execute_transfer(
+                    user=self.sender,
+                    source_wallet_id=self.source_wallet.id,
+                    destination_wallet_id=self.destination_wallet.id,
+                    amount=5000,
+                    currency="NGN",
+                    idempotency_key="outbox-failure-001",
+                    path="/v1/transfers",
+                    request_id="test-request-003",
+                )
+
+        self.assertFalse(
+            Transaction.objects.filter(
+                source_wallet=self.source_wallet,
+                destination_wallet=self.destination_wallet,
+            ).exists()
+        )
+
+        self.assertEqual(
+            get_wallet_balance(wallet=self.source_wallet),
+            source_balance_before,
+        )
+        self.assertEqual(
+            get_wallet_balance(wallet=self.destination_wallet),
+            destination_balance_before,
+        )
+        self.assertFalse(
+            OutboxEvent.objects.filter(
+                event_type="transfer_posted"
+            ).exists()
+        )
+        self.assertFalse(
+            IdempotencyKey.objects.filter(
+                user=self.sender,
+                key="outbox-failure-001",
+            ).exists()
         )
