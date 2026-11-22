@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     "apps.payments",
     "apps.idempotency",
     "apps.outbox.apps.OutboxConfig",
+    "apps.audit.apps.AuditConfig",
 ]
 
 MIDDLEWARE = [
