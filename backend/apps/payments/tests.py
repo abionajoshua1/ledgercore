@@ -41,6 +41,13 @@ from apps.idempotency.models import IdempotencyKey
 from apps.outbox.models import OutboxEvent
 from apps.audit.models import AuditEvent
 
+from apps.payments.deposit_services import (
+    initiate_deposit,
+    InvalidDepositError,
+    WalletNotFoundError,
+    WalletInactiveError,
+)
+
 class TransactionReferenceTests(SimpleTestCase):
 
     def test_reference_has_expected_prefix(self):
@@ -1198,3 +1205,147 @@ class TransferCurrencyValidationTests(TransactionTestCase):
                 key="audit-failure-001",
             ).exists()
         )
+        
+class DepositInitiationTests(TestCase):
+
+    def setUp(self):
+        User = get_user_model()
+
+        self.user = User.objects.create_user(
+            username="deposit_user",
+            password="test-password",
+        )
+
+        self.ngn = Currency.objects.create(
+            currency_code="NGN",
+            currency_name="Nigerian Naira",
+            minor_unit_exponent=2,
+        )
+
+        self.wallet = create_wallet(
+            user=self.user,
+            currency=self.ngn,
+        )
+
+    def test_initiates_deposit_without_posting_journal_entry(self):
+        status, response, replayed = initiate_deposit(
+            user=self.user,
+            wallet_id=self.wallet.id,
+            amount=15000,
+            currency="NGN",
+            idempotency_key="deposit-initiation-001",
+            path="/v1/deposits",
+        )
+
+        deposit = Transaction.objects.get(
+            id=response["id"],
+        )
+
+        self.assertEqual(status, 202)
+        self.assertFalse(replayed)
+        self.assertEqual(deposit.type, OperationType.DEPOSIT)
+        self.assertEqual(deposit.status, TransactionStatus.PENDING)
+        self.assertEqual(deposit.amount, 15000)
+        self.assertEqual(deposit.destination_wallet, self.wallet)
+        self.assertTrue(
+            deposit.provider_reference.startswith("SIM-DEP-")
+        )
+        self.assertEqual(
+            JournalEntry.objects.filter(
+                transaction=deposit,
+            ).count(),
+            0,
+        )
+
+    def test_replays_same_request_without_creating_another_deposit(self):
+        first_status, first_response, first_replayed = initiate_deposit(
+            user=self.user,
+            wallet_id=self.wallet.id,
+            amount=15000,
+            currency="NGN",
+            idempotency_key="deposit-replay-001",
+            path="/v1/deposits",
+        )
+
+        second_status, second_response, second_replayed = initiate_deposit(
+            user=self.user,
+            wallet_id=self.wallet.id,
+            amount=15000,
+            currency="NGN",
+            idempotency_key="deposit-replay-001",
+            path="/v1/deposits",
+        )
+
+        self.assertEqual(first_status, 202)
+        self.assertEqual(second_status, 202)
+        self.assertFalse(first_replayed)
+        self.assertTrue(second_replayed)
+        self.assertEqual(first_response, second_response)
+        self.assertEqual(
+            Transaction.objects.filter(
+                destination_wallet=self.wallet,
+                type=OperationType.DEPOSIT,
+            ).count(),
+            1,
+        )
+
+    def test_rejects_reuse_of_idempotency_key_with_different_amount(self):
+        initiate_deposit(
+            user=self.user,
+            wallet_id=self.wallet.id,
+            amount=15000,
+            currency="NGN",
+            idempotency_key="deposit-reuse-001",
+            path="/v1/deposits",
+        )
+
+        with self.assertRaises(IdempotencyKeyReuseError):
+            initiate_deposit(
+                user=self.user,
+                wallet_id=self.wallet.id,
+                amount=20000,
+                currency="NGN",
+                idempotency_key="deposit-reuse-001",
+                path="/v1/deposits",
+            )
+
+    def test_rejects_zero_amount(self):
+        with self.assertRaises(InvalidDepositError):
+            initiate_deposit(
+                user=self.user,
+                wallet_id=self.wallet.id,
+                amount=0,
+                currency="NGN",
+                idempotency_key="deposit-zero-001",
+                path="/v1/deposits",
+            )
+
+    def test_rejects_wallet_owned_by_another_user(self):
+        another_user = get_user_model().objects.create_user(
+            username="another_deposit_user",
+            password="test-password",
+        )
+
+        with self.assertRaises(WalletNotFoundError):
+            initiate_deposit(
+                user=another_user,
+                wallet_id=self.wallet.id,
+                amount=15000,
+                currency="NGN",
+                idempotency_key="deposit-owner-001",
+                path="/v1/deposits",
+            )
+
+    def test_rejects_inactive_wallet(self):
+        self.wallet.status = self.wallet.Status.INACTIVE
+        self.wallet.save(update_fields=["status"])
+
+        with self.assertRaises(WalletInactiveError):
+            initiate_deposit(
+                user=self.user,
+                wallet_id=self.wallet.id,
+                amount=15000,
+                currency="NGN",
+                idempotency_key="deposit-inactive-001",
+                path="/v1/deposits",
+            )

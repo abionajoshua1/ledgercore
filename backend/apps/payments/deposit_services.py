@@ -165,14 +165,27 @@ def initiate_deposit(
     for _ in range(3):
         provider_reference = generate_provider_reference()
 
-        with transaction.atomic():
-            deposit = create_transaction(
-                type=OperationType.DEPOSIT,
-                amount=amount,
-                currency=wallet.currency,
-                destination_wallet=wallet,
-                provider_reference=provider_reference,
+        try:
+            with transaction.atomic():
+                deposit = create_transaction(
+                    type=OperationType.DEPOSIT,
+                    amount=amount,
+                    currency=wallet.currency,
+                    destination_wallet=wallet,
+                    provider_reference=provider_reference,
+                )
+                break
+
+        except IntegrityError as exc:
+            cause = exc.__cause__
+            constraint_name = getattr(
+                getattr(cause, "diag", None),
+                "constraint_name",
+                None,
             )
+
+            if constraint_name != "payments_transaction_provider_reference_key":
+                raise
 
     if deposit is None:
         raise RuntimeError(
